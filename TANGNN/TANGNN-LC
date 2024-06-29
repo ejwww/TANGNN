@@ -122,7 +122,11 @@ class CustomGNN(nn.Module):
             self.transformer_layers.append(MultiLayerTransformer(hidden_channels, num_heads, 1))
             self.dimension_adjustments.append(DimensionAdjustmentLayer(hidden_channels * 2, hidden_channels))
         self.final_lin = nn.Linear(hidden_channels*2 , out_channels)
-
+        self.mlp = nn.Sequential(
+            nn.Linear(hidden_channels*2, hidden_channels * 2),
+            nn.ReLU(),
+            nn.Linear(hidden_channels * 2, out_channels)
+        )
     def forward(self, data):
         x, edge_index = data.x, data.edge_index
         layer_outputs = []  # 存储每一层的输出
@@ -169,7 +173,7 @@ class CustomGNN(nn.Module):
         final_output = torch.cat(layer_outputs, dim=1)
 
         # 最终线性层处理输出
-        out = self.final_lin(final_output)
+        out = self.mlp(final_output)
         return F.log_softmax(out, dim=1)
 
     def top_m_sampling(self, node_embeddings, m):
@@ -232,7 +236,7 @@ class CustomGNN(nn.Module):
         with torch.no_grad():
             self.a.copy_(a_new)
 # 加载Cora数据集
-dataset = Reddit(root='data/Cora')
+dataset = Planetoid(root='data/Cora', name='Cora')
 data = dataset[0]
 loader = DataLoader(dataset, batch_size=256, shuffle=True, num_workers=4)
 
