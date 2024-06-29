@@ -1,0 +1,329 @@
+from sklearn.metrics import f1_score
+import torch
+import torch.nn.functional as F
+from torch_geometric.datasets import Planetoid
+from torch_geometric.loader import DataLoader
+from torch_geometric.nn import SAGEConv, GATConv, global_mean_pool
+import torch.nn as nn
+from torch.optim import Adam
+from torch_geometric.utils import from_networkx, to_networkx
+import networkx as nx
+from torch_geometric.datasets import ZINC
+from sklearn.metrics import f1_score
+from sklearn.metrics import roc_auc_score
+from sklearn.preprocessing import label_binarize
+from torch.nn.functional import one_hot
+
+class GraphSAGENet(nn.Module):
+    def __init__(self, in_channels, hidden_channels, out_channels, sample_size=10):
+        super(GraphSAGENet, self).__init__()
+        self.conv1 = SAGEConv(in_channels, hidden_channels)
+        self.conv2 = SAGEConv(hidden_channels, out_channels)
+        self.dropout = nn.Dropout(p=0.3)
+        self.sample_size = sample_size  # 新增：采样大小
+
+    def forward(self, x, edge_index):
+        # 采样邻居
+        sampled_edge_index = self.sample_neighbors(edge_index, x.size(0))
+
+        x = F.relu(self.conv1(x, sampled_edge_index))  # 使用采样的边
+        x = self.dropout(x)
+        x = F.relu(self.conv2(x, sampled_edge_index))  # 使用采样的边
+        return x
+
+    def sample_neighbors(self, edge_index, num_nodes):
+        # 这是一个非常简化的邻居采样实现，仅用于示例
+        sampled_edges = []
+        for node in range(num_nodes):
+            neighbors = edge_index[1][edge_index[0] == node]
+            if len(neighbors) > self.sample_size:
+                neighbors = neighbors[torch.randperm(len(neighbors))[:self.sample_size]]
+            for neighbor in neighbors:
+                sampled_edges.append([node, neighbor.item()])
+        return torch.tensor(sampled_edges).t().contiguous()
+
+
+class TransformerLayer(nn.Module):
+    def __init__(self, embedding_dim, num_heads):
+        super(TransformerLayer, self).__init__()
+        self.multihead_attn = nn.MultiheadAttention(embed_dim=embedding_dim, num_heads=num_heads, batch_first=True)
+        self.layer_norm1 = nn.LayerNorm(embedding_dim)
+        self.feed_forward = nn.Sequential(
+            nn.Linear(embedding_dim, embedding_dim * 4),
+            nn.ReLU(),
+            nn.Linear(embedding_dim * 4, embedding_dim)
+        )
+        self.layer_norm2 = nn.LayerNorm(embedding_dim)
+
+    def forward(self, x):
+        attn_output, _ = self.multihead_attn(x, x, x)
+        x = self.layer_norm1(attn_output + x)
+        ff_output = self.feed_forward(x)
+        x = self.layer_norm2(ff_output + x)
+        return x
+
+class MultiLayerTransformer(nn.Module):
+    def __init__(self, embedding_dim, num_heads, num_layers):
+        super(MultiLayerTransformer, self).__init__()
+        self.layers = nn.ModuleList([
+            TransformerLayer(embedding_dim, num_heads) for _ in range(num_layers)
+        ])
+
+    def forward(self, x):
+        for i, layer in enumerate(self.layers):
+            x = layer(x)
+            print(f"Transformer - After Layer {i+1} output shape:", x.shape)  # 打印每一层输出形状
+        return x
+
+class DimensionAdjustmentLayer(nn.Module):
+    def __init__(self, input_dim, output_dim):
+        super(DimensionAdjustmentLayer, self).__init__()
+        self.fc1 = nn.Linear(input_dim, input_dim * 2)
+        self.relu1 = nn.ReLU()
+        self.fc2 = nn.Linear(input_dim * 2, output_dim)
+        self.relu2 = nn.ReLU()
+
+    def forward(self, x):
+        x = self.fc1(x)
+        x = self.relu1(x)
+        x = self.fc2(x)
+        x = self.relu2(x)
+        return x
+
+
+class CustomGNN(nn.Module):
+    def __init__(self, in_channels, hidden_channels, out_channels, num_heads, num_layers, m, num_nodes, sample_size):
+        super(CustomGNN, self).__init__()
+        self.num_layers = num_layers
+        self.m = m
+        self.num_nodes = num_nodes
+        self.a = nn.Parameter(torch.randn(hidden_channels, 1))
+        self.graphsage_layers = nn.ModuleList()
+        self.transformer_layers = nn.ModuleList()
+        self.embedding_adjustment = nn.Linear(hidden_channels * 2, hidden_channels)
+        self.dimension_adjustments = nn.ModuleList()  # 此处修正
+
+        # 正确设置第一层的输入通道数
+        self.dimension_adjustments.append(DimensionAdjustmentLayer(in_channels, hidden_channels))
+        self.graphsage_layers.append(GraphSAGENet(in_channels, hidden_channels, hidden_channels,sample_size))
+        self.transformer_layers.append(MultiLayerTransformer(hidden_channels, num_heads, 1))
+
+        # 后续层的GraphSAGE层输入和输出维度
+        for _ in range(1, self.num_layers):
+            self.dimension_adjustments.append(DimensionAdjustmentLayer(hidden_channels * 2, hidden_channels))
+            self.graphsage_layers.append(
+                GraphSAGENet(hidden_channels*2, hidden_channels, hidden_channels))
+            self.transformer_layers.append(MultiLayerTransformer(hidden_channels, num_heads, 1))
+            self.dimension_adjustments.append(DimensionAdjustmentLayer(hidden_channels * 2, hidden_channels))
+        self.final_lin = nn.Linear(hidden_channels*2 , out_channels)
+
+        self.mlp = nn.Sequential(
+            nn.Linear(hidden_channels * 2, hidden_channels * 2),
+            nn.ReLU(),
+            nn.Linear(hidden_channels * 2, out_channels)
+        )
+
+    def forward(self, data):
+        x, edge_index = data.x, data.edge_index
+        previous_transformer_output = None
+
+        for i in range(self.num_layers):
+            # GraphSAGE层处理
+            sage_out = self.graphsage_layers[i](x, edge_index)
+            print("Shape of sage_out:", sage_out.shape)
+            if sage_out.dim() == 2:
+                sage_out = sage_out.unsqueeze(0)  # 确保 sage_out 是三维的
+
+            # 处理采样特征
+            if i == 0:
+                sampled_features = self.top_m_sampling(x, self.m)
+            else:
+                # 确保每层更新后的节点特征用于新的采样
+                sampled_features = self.top_m_sampling(combined_features.squeeze(0), self.m)
+
+            sampled_features = self.dimension_adjustments[i](sampled_features)
+
+            if sampled_features.dim() == 2:
+                sampled_features = sampled_features.unsqueeze(0)
+
+            # 计算重复次数以匹配节点数
+            needed_repeats = sage_out.size(1) // sampled_features.size(1)
+            if sage_out.size(1) % sampled_features.size(1) != 0:
+                needed_repeats += 1  # 确保覆盖所有节点
+
+            sampled_features = sampled_features.repeat(1, needed_repeats, 1)
+            sampled_features = sampled_features[:, :sage_out.size(1), :]  # 确保大小匹配
+
+            # 拼接GraphSAGE和Transformer层的输出作为下一层的输入
+            combined_features = torch.cat([sage_out, sampled_features], dim=2)
+            adjusted_features = self.embedding_adjustment(combined_features)
+
+            # Transformer层处理
+            transformer_input = adjusted_features
+            transformer_out = self.transformer_layers[i](transformer_input)
+            previous_transformer_output = transformer_out.squeeze(0)
+
+            # 更新x为下一层的输入
+            x = combined_features.squeeze(0) if combined_features.dim() > 2 else combined_features
+
+        # 最终线性层处理输出
+        out = self.mlp(x)
+        return F.log_softmax(out, dim=1)
+
+    def top_m_sampling(self, node_embeddings, m):
+        num_nodes, _ = node_embeddings.size()
+        a_expanded = self.a
+
+        # 确保不超过实际的节点数量
+        m_adjusted = min(m, num_nodes)
+
+        pos_similarity = self.cosine_similarity(F.relu(node_embeddings), a_expanded)
+
+        print(f"pos_similarity size: {pos_similarity.size(0)}")
+        print(f"m_adjusted: {m_adjusted}")
+
+        # 检查以避免"selected index k out of range"错误
+        if pos_similarity.size(0) < m_adjusted:
+            print("Warning: pos_similarity size is less than m_adjusted.")
+            m_adjusted = pos_similarity.size(0)  # 调整m_adjusted以避免错误
+
+        if m_adjusted == 0:  # 如果m_adjusted为0，直接返回一个空的张量
+            print("Warning: m_adjusted is 0, returning empty tensor.")
+            return torch.empty((0, node_embeddings.size(1)))
+
+        _, top_indices = torch.topk(pos_similarity.squeeze(), m_adjusted, largest=True)
+
+        sampled_features = node_embeddings[top_indices]
+
+        return sampled_features.unsqueeze(0)  # 为了兼容后续操作，保持批维度
+
+    def find_common_indices(self, indices1, indices2, m):
+        # 确保indices1和indices2是一维的并且在同一设备上
+        indices1_flat = indices1.view(-1).to(indices2.device)
+        indices2_flat = indices2.view(-1)
+
+        # 找到交集
+        common_indices, indices1_common_idx = torch.unique(torch.cat((indices1_flat, indices2_flat), dim=0),
+                                                           sorted=False, return_inverse=True)[:2]
+        indices1_counts = torch.bincount(indices1_common_idx[:len(indices1_flat)])
+        indices2_counts = torch.bincount(indices1_common_idx[len(indices1_flat):])
+        mask = (indices1_counts > 0) & (indices2_counts > 0)
+        common = common_indices[mask]
+
+        # 如果交集的元素个数不足m，则尝试从indices1或indices2补充，直到达到m个
+        if len(common) < m:
+            extra_from_indices1 = indices1_flat[~mask[:len(indices1_flat)]][:m - len(common)]
+            common = torch.cat([common, extra_from_indices1])
+        if len(common) < m:
+            extra_from_indices2 = indices2_flat[~mask[len(indices1_flat):]][:m - len(common)]
+            common = torch.cat([common, extra_from_indices2])
+
+        # 如果共同元素超过m个，只取前m个
+        return common[:m]
+
+    def cosine_similarity(self, node_embeddings, a):
+        # 动态调整a的形状以匹配node_embeddings的特征维度
+        # 但由于直接扩展a的大小可能会遇到问题，我们考虑使用不同的策略
+
+        # 确保node_embeddings是二维的，形状为[节点数, 特征数]
+        if node_embeddings.dim() == 3:
+            # 如果是三维的，假设形状为[批次大小, 节点数, 特征数]，则合并批次和节点维度
+            node_embeddings = node_embeddings.view(-1, node_embeddings.size(-1))
+
+        # 获取node_embeddings的特征维度
+        feature_dim = node_embeddings.size(1)
+
+        if a.size(0) != feature_dim:
+            a_expanded = torch.ones((feature_dim, 1), device=node_embeddings.device)
+        else:
+            a_expanded = a
+
+        # 对a进行归一化
+        a_expanded_norm = F.normalize(a_expanded, p=2, dim=0)
+
+        # 对节点嵌入进行归一化
+        node_embeddings_norm = F.normalize(node_embeddings, p=2, dim=1)
+
+        # 执行矩阵乘法
+        similarity = torch.mm(node_embeddings_norm, a_expanded_norm)
+
+        return similarity
+
+    def update_a(self, x_bar):
+        # 假设 x_bar 已经是所有节点特征的平均值
+        # 首先移除 a 在 x_bar 方向上的成分
+        projection = (self.a.T @ x_bar).squeeze()  # 计算 a 在 x_bar 方向上的投影
+        a_minus_projection = self.a - (projection * x_bar)  # 移除投影
+
+        # 然后对 a 执行 L2 范数正则化，得到更新后的 a
+        a_new = F.normalize(a_minus_projection, p=2, dim=0)  # 使用 L2 范数进行正则化
+        with torch.no_grad():
+            self.a.copy_(a_new)
+# 加载Cora数据集
+dataset = Planetoid(root='data/Cora', name='Cora')
+loader = DataLoader(dataset, batch_size=128, shuffle=True)
+
+
+# Initialize model and optimizer
+model = CustomGNN(
+    in_channels=dataset.num_node_features,
+    hidden_channels=32,
+    out_channels=dataset.num_classes,
+    num_heads=1,
+    num_layers=2,
+    m=20,
+    num_nodes=dataset[0].num_nodes,
+    sample_size=5
+)
+optimizer = Adam(model.parameters(), lr=0.005, weight_decay=1e-4)
+
+# Train model
+model.train()
+for epoch in range(80):
+    optimizer.zero_grad()
+    out = model(dataset[0])
+    loss = F.nll_loss(out[dataset[0].train_mask], dataset[0].y[dataset[0].train_mask])
+    loss.backward()
+    optimizer.step()
+    if epoch % 10 == 0:
+        print(f"Epoch {epoch+1}, Loss: {loss.item()}")
+
+
+model.eval()
+with torch.no_grad():
+    logits = model(dataset[0])  # Get logits from your model
+    probs = F.softmax(logits, dim=1)  # Convert logits to probabilities
+
+# Prepare labels
+true_labels = dataset[0].y[dataset[0].test_mask].cpu().numpy()
+# Convert true labels to one-hot encoding
+y_true_one_hot = one_hot(dataset[0].y[dataset[0].test_mask]).cpu().numpy()
+
+# Get predicted probabilities for the test mask
+y_pred_probs = probs[dataset[0].test_mask].cpu().numpy()
+
+# Calculate ROC AUC
+roc_auc = roc_auc_score(y_true_one_hot, y_pred_probs, multi_class='ovr', average='macro')  # 'ovr' stands for One-vs-Rest
+print(f"Macro ROC AUC: {roc_auc}")
+'''
+# Evaluate model using F1-score
+model.eval()
+_, pred = out.max(dim=1)
+true_labels = dataset[0].y[dataset[0].test_mask].cpu().numpy()
+predicted_labels = pred[dataset[0].test_mask].cpu().numpy()
+
+# Calculate F1-scores
+f1 = f1_score(true_labels, predicted_labels, average=None)
+f1_micro = f1_score(true_labels, predicted_labels, average='micro')
+
+num_classes = dataset.num_classes
+true_labels_binarized = label_binarize(true_labels, classes=range(num_classes))
+predicted_labels_binarized = label_binarize(predicted_labels, classes=range(num_classes))
+
+# Calculate ROC AUC
+roc_auc = roc_auc_score(true_labels_binarized, predicted_labels_binarized, average='macro')  # 或 'micro'
+print(f'Macro ROC AUC: {roc_auc}')
+f1_weighted = f1_score(true_labels, predicted_labels, average='weighted')
+print(f'Micro F1-Score: {f1_micro}')
+print(f'F1-Score per class: {f1}')
+print(f'Weighted F1-Score: {f1_weighted}')'''
