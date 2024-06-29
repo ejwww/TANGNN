@@ -1,0 +1,271 @@
+import torch
+import torch.nn.functional as F
+from matplotlib import pyplot as plt
+from sklearn.manifold import TSNE
+from torch_geometric.datasets import Planetoid
+from torch_geometric.loader import DataLoader
+from torch_geometric.nn import SAGEConv, GATConv, global_mean_pool
+import torch.nn as nn
+from torch.optim import Adam
+from torch_geometric.utils import from_networkx, to_networkx
+import networkx as nx
+from torch_geometric.datasets import ZINC
+from sklearn.metrics import roc_auc_score, f1_score
+from torch.nn.functional import one_hot
+import numpy as np
+
+class GraphSAGENet(nn.Module):
+    def __init__(self, in_channels, hidden_channels, out_channels):
+        super(GraphSAGENet, self).__init__()
+        self.conv1 = SAGEConv(in_channels, hidden_channels)
+        self.conv2 = SAGEConv(hidden_channels, out_channels)
+
+    def forward(self, x, edge_index):
+        x = F.relu(self.conv1(x, edge_index))
+        print("GraphSAGENet - After Conv1 output shape:", x.shape)  # 打印第一层输出形状
+        x = self.conv2(x, edge_index)
+        print("GraphSAGENet - After Conv2 output shape:", x.shape)  # 打印第二层输出形状
+        return x
+
+class TransformerLayer(nn.Module):
+    def __init__(self, embedding_dim, num_heads):
+        super(TransformerLayer, self).__init__()
+        self.multihead_attn = nn.MultiheadAttention(embed_dim=embedding_dim, num_heads=num_heads, batch_first=True)
+        self.layer_norm1 = nn.LayerNorm(embedding_dim)
+        self.feed_forward = nn.Sequential(
+            nn.Linear(embedding_dim, embedding_dim * 4),
+            nn.ReLU(),
+            nn.Linear(embedding_dim * 4, embedding_dim)
+        )
+        self.layer_norm2 = nn.LayerNorm(embedding_dim)
+
+    def forward(self, x):
+        attn_output, _ = self.multihead_attn(x, x, x)
+        x = self.layer_norm1(attn_output + x)
+        ff_output = self.feed_forward(x)
+        x = self.layer_norm2(ff_output + x)
+        return x
+
+class MultiLayerTransformer(nn.Module):
+    def __init__(self, embedding_dim, num_heads, num_layers):
+        super(MultiLayerTransformer, self).__init__()
+        self.layers = nn.ModuleList([
+            TransformerLayer(embedding_dim, num_heads) for _ in range(num_layers)
+        ])
+
+    def forward(self, x):
+        for i, layer in enumerate(self.layers):
+            x = layer(x)
+            print(f"Transformer - After Layer {i+1} output shape:", x.shape)  # 打印每一层输出形状
+        return x
+
+
+
+class CustomGNN(nn.Module):
+    def __init__(self, in_channels, hidden_channels, out_channels, num_heads, num_layers, m, num_nodes):
+        super(CustomGNN, self).__init__()
+
+        self.a = nn.Parameter(torch.randn(hidden_channels, 1))  # 初始化辅助向量 a
+        self.graphsage = GraphSAGENet(in_channels, hidden_channels, hidden_channels)
+        self.adjust_dim = nn.Linear(in_channels, hidden_channels)
+        self.transformer = MultiLayerTransformer(hidden_channels, num_heads, num_layers)
+        self.mlp = nn.Sequential(
+            nn.Linear(hidden_channels * 2, hidden_channels),  # Adjust to match the concatenated feature size
+            nn.ReLU(),
+            nn.Linear(hidden_channels, out_channels)
+        )
+        self.num_nodes = num_nodes
+        self.m = m
+
+    def forward(self, data, return_embedding=False):
+        x, edge_index = data.x, data.edge_index
+        adjusted_x = self.adjust_dim(x)
+        transformer_input = self.top_m_sampling(adjusted_x, self.m)
+        sage_out = self.graphsage(x, edge_index)
+
+        transformer_out = self.transformer(transformer_input)
+        transformer_out = transformer_out.mean(dim=1)
+
+
+        transformer_out = transformer_out.expand(sage_out.size(0), -1)
+
+        combined_out = torch.cat([sage_out, transformer_out.expand_as(sage_out)], dim=1)
+        if return_embedding:
+            return x
+        # 通过MLP获得最终输出
+        out = self.mlp(combined_out)
+        return F.log_softmax(out, dim=1)
+
+    def top_m_sampling(self, node_embeddings, m):
+        if node_embeddings.dim() == 2:
+            node_embeddings = node_embeddings.unsqueeze(0)  # 增加批次维度
+        batch_size, num_nodes, _ = node_embeddings.size()
+        a_expanded = self.a.expand(batch_size, -1, -1)
+
+        sampled_features = torch.zeros((batch_size, m, node_embeddings.size(-1)), device=node_embeddings.device)
+
+        for i in range(batch_size):
+            # 确保不超过实际的节点数量
+            m_adjusted = min(m, num_nodes)
+
+            pos_similarity = self.cosine_similarity(F.relu(node_embeddings[i]), a_expanded[i])
+            neg_similarity = self.cosine_similarity(F.relu(-node_embeddings[i]), a_expanded[i])
+
+            # 确保m_adjusted不大于相似度向量的长度
+            m_adjusted = min(m_adjusted, pos_similarity.size(0), neg_similarity.size(0))
+
+            _, pos_indices = torch.topk(pos_similarity, m_adjusted, largest=True)
+            _, neg_indices = torch.topk(neg_similarity, m_adjusted, largest=True)
+
+            common_indices = self.find_common_indices(pos_indices, neg_indices, m_adjusted)
+            sampled_features[i] = node_embeddings[i, common_indices]
+
+        return sampled_features
+
+    def find_common_indices(self, indices1, indices2, m):
+        # 确保indices1和indices2是一维的并且在同一设备上
+        indices1_flat = indices1.view(-1).to(indices2.device)
+        indices2_flat = indices2.view(-1)
+
+        # 找到交集
+        common_indices, indices1_common_idx = torch.unique(torch.cat((indices1_flat, indices2_flat), dim=0),
+                                                           sorted=False, return_inverse=True)[:2]
+        indices1_counts = torch.bincount(indices1_common_idx[:len(indices1_flat)])
+        indices2_counts = torch.bincount(indices1_common_idx[len(indices1_flat):])
+        mask = (indices1_counts > 0) & (indices2_counts > 0)
+        common = common_indices[mask]
+
+        if len(common) < m:
+            extra_from_indices1 = indices1_flat[~mask[:len(indices1_flat)]][:m - len(common)]
+            common = torch.cat([common, extra_from_indices1])
+        if len(common) < m:
+            extra_from_indices2 = indices2_flat[~mask[len(indices1_flat):]][:m - len(common)]
+            common = torch.cat([common, extra_from_indices2])
+        return common[:m]
+
+    def cosine_similarity(self, node_embeddings, a_expanded):
+        # 确保node_embeddings是二维的，形状为[节点数, 特征数]
+        if node_embeddings.dim() == 3:
+            # 如果是三维的，假设形状为[批次大小, 节点数, 特征数]，则合并批次和节点维度
+            node_embeddings = node_embeddings.view(-1, node_embeddings.size(-1))
+
+        # 对辅助向量a进行归一化并调整其形状以便于执行矩阵乘法
+        a_expanded_norm = F.normalize(a_expanded, p=2, dim=-1)  # 确保沿着最后一个维度归一化
+        a_expanded_norm = a_expanded_norm.squeeze().view(-1, 1)  # 调整形状为[特征数, 1]
+
+        # 对节点嵌入进行归一化
+        node_embeddings_norm = F.normalize(node_embeddings, p=2, dim=-1)
+
+        # 执行矩阵乘法
+        similarity = torch.mm(node_embeddings_norm, a_expanded_norm)
+
+        return similarity
+
+    def update_a(self, x_bar):
+        # 假设 x_bar 已经是所有节点特征的平均值
+        # 首先移除 a 在 x_bar 方向上的成分
+        projection = (self.a.T @ x_bar).squeeze()  # 计算 a 在 x_bar 方向上的投影
+        a_minus_projection = self.a - (projection * x_bar)  # 移除投影
+
+        # 然后对 a 执行 L2 范数正则化，得到更新后的 a
+        a_new = F.normalize(a_minus_projection, p=2, dim=0)  # 使用 L2 范数进行正则化
+        with torch.no_grad():
+            self.a.copy_(a_new)
+# 加载Cora数据集
+dataset = Planetoid(root='data/Cora', name='Cora')
+batch_size = 64  # 或您希望的任何小批量大小
+loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+# 数据集参数
+data = dataset[0]  # Cora数据集只有一个图
+num_nodes = data.num_nodes
+num_train = int(num_nodes * 0.9)  # 假设%为训练
+num_test = num_nodes - num_train  # 剩余为测试
+
+indices = torch.randperm(num_nodes)
+train_mask = indices[:num_train]
+test_mask = indices[num_train:]
+
+data.train_mask = torch.zeros(num_nodes, dtype=torch.bool)
+data.test_mask = torch.zeros(num_nodes, dtype=torch.bool)
+data.train_mask[train_mask] = True
+data.test_mask[test_mask] = True
+in_channels = dataset.num_node_features
+out_channels = dataset.num_classes
+
+# 初始化模型和优化器
+model = CustomGNN(in_channels=in_channels, hidden_channels=32, out_channels=out_channels, num_heads=1, num_layers=3, m=1, num_nodes=data.num_nodes)
+optimizer = Adam(model.parameters(), lr=0.002)
+
+# 训练模型
+model.train()
+for epoch in range(200):
+    optimizer.zero_grad()  # 清空之前的梯度
+    out = model(data)  # 直接在整个图上运行模型
+    loss = F.nll_loss(out[data.train_mask], data.y[data.train_mask])  # 计算损失
+    loss.backward()  # 反向传播计算梯度
+    optimizer.step()  # 根据梯度更新模型参数
+
+    print(f"Epoch {epoch+1}, Loss: {loss.item()}")
+
+
+def evaluate_model(model, data):
+    model.eval()
+    with torch.no_grad():
+        # 计算模型输出
+        out = model(data)
+        probs = F.softmax(out, dim=1)
+
+        # 获取测试集的真实标签和预测概率
+        y_true = data.y[data.test_mask].cpu().numpy()
+        y_pred_probs = probs[data.test_mask].cpu().numpy()
+
+        # 对于多分类问题，需要将真实标签转换为one-hot编码
+        y_true_one_hot = one_hot(data.y[data.test_mask]).cpu().numpy()
+
+        # 计算AUROC，这通常适用于二分类问题，对于多分类问题，计算方法会略有不同
+        # 对于多分类问题，需要逐个类别计算AUROC，然后计算平均值
+        auroc = roc_auc_score(y_true_one_hot, y_pred_probs, multi_class='ovr')
+
+        # 将概率转换为最终的预测类别
+        y_pred = np.argmax(y_pred_probs, axis=1)
+
+        # 计算F1 Score，这里使用'macro'平均，这样每个类别的F1得分将被平等对待
+        f1 = f1_score(y_true, y_pred, average='macro')
+
+        return auroc, f1
+
+
+# 评估模型
+auroc, f1 = evaluate_model(model, data)
+print(f'AUROC: {auroc:.4f}, F1 Score: {f1:.4f}')
+# 测试模型
+'''
+model.eval()
+_, pred = model(data).max(dim=1)
+correct = int(pred[data.test_mask].eq(data.y[data.test_mask]).sum().item())
+accuracy = correct / int(data.test_mask.sum())
+print(f'Accuracy: {accuracy}')
+with torch.no_grad():
+    out = model(data)  # 使用整个data对象
+    embeddings = out
+
+
+# 可视化
+tsne = TSNE(n_components=2, perplexity=20, n_iter=1000)
+embeddings_2d = tsne.fit_transform(embeddings.numpy())
+colors = np.array(['red', 'green', 'blue'])
+
+# Then use these colors for each point based on its class.
+plt.figure(figsize=(12, 8))
+scatter = plt.scatter(
+    embeddings_2d[:, 0], embeddings_2d[:, 1],
+    c=colors[data.y.cpu().numpy()],  # Use the class label as an index for colors
+    s=7,
+    alpha=0.8,
+    edgecolors='none')
+# You can also set the size for the tick labels like this:
+plt.xticks(fontsize=22)
+plt.yticks(fontsize=22)
+plt.title('')
+plt.savefig("NAGFormer.jpg", dpi=200)
+plt.show()'''
